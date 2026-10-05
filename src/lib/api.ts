@@ -1,0 +1,870 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SEAM — live edition.
+//
+// This is the data layer between the React UI and the Cloudflare Worker
+// (worker/index.js). Everything the dashboard shows comes from the Worker's
+// authenticated /api/* routes; the session is an HttpOnly cookie, so requests
+// just carry credentials. Transcript segments are mapped onto the UI's existing
+// Episode/Podcast model in lib/meetings.ts, so components stay unchanged.
+//
+// A few podcast-era exports (directory search, video resolve, the weekly EMAIL
+// digest) have no meeting backend and remain inert no-ops so their callers keep
+// compiling; they are hidden in the meetings UI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { Episode, Podcast, Summary, WeeklyAi, WeeklySchedule, WeeklySummary } from './types'
+import type { EmailResult } from './email'
+import { normalizeRecipients } from './recipientsStore'
+import { meetingsFromSegments, decodeMeetingId, type RawSegment } from './meetings'
+import type { StoredSegment, VideoRecord } from './videos'
+
+/** Thrown when an /api call comes back 401 — the session expired or is missing. */
+export class NotAuthedError extends Error {
+  constructor() {
+    super('not_authenticated')
+    this.name = 'NotAuthedError'
+  }
+}
+
+/** Generic API failure carrying the server's human message. */
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+/** Kept for back-compat with the old summary pipeline. No longer thrown. */
+export class NoApiKeyError extends Error {}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
+    ...init,
+  })
+  let data: any = null
+  try {
+    data = await res.json()
+  } catch {
+    /* non-JSON (e.g. an asset 404) — leave data null */
+  }
+  if (res.status === 401) throw new NotAuthedError()
+  if (!res.ok) throw new ApiError((data && (data.error || data.detail)) || `Request failed (${res.status})`, res.status)
+  return data as T
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+export interface Me {
+  authenticated: boolean
+  email?: string
+  isAdmin?: boolean
+  /** Organisation id carried on the session (host-token logins only). Reported
+   *  for visibility — nothing is scoped by it. */
+  orgId?: string | null
+  codeRequired?: boolean
+}
+
+/** What the Worker says about why this session can or can't see meetings.
+ *  See the Worker's handleWhoami. */
+export interface Whoami {
+  email: string
+  orgId: string | null
+  isAdmin: boolean
+  orgScopingEnabled: boolean
+  meetings: {
+    viaMeetingOwners: number | null
+    viaLegacyOwnerEmail: number | null
+    visible: number | null
+  }
+  /** Masked near-miss owner addresses (e.g. "n***l@example.com"). */
+  similarOwners: string[]
+  verdict: string
+}
+
+/** Diagnoses an empty dashboard: the address this session is actually keyed on,
+ *  how many meetings each branch of the visibility rule matches, and any
+ *  near-miss owner addresses. */
+export function whoami(): Promise<Whoami> {
+  return request<Whoami>('/api/debug/whoami')
+}
+
+/** Probe the session. Returns the signed-in user or an unauthenticated marker
+ *  (never throws on 401 — that IS the answer the login screen needs). */
+export async function getMe(): Promise<Me> {
+  const res = await fetch('/api/me', { credentials: 'same-origin' })
+  const data = (await res.json().catch(() => ({}))) as Me
+  if (res.status === 401) return { authenticated: false, codeRequired: !!data.codeRequired }
+  return { ...data, authenticated: true }
+}
+
+export function login(email: string, password: string): Promise<{ ok: boolean; admin?: boolean; email?: string }> {
+  return request('/api/login', { method: 'POST', body: JSON.stringify({ email, password }) })
+}
+
+export function register(email: string, password: string, code?: string): Promise<{ ok: boolean; email?: string }> {
+  return request('/api/register', { method: 'POST', body: JSON.stringify({ email, password, code }) })
+}
+
+export function logout(): Promise<{ ok: boolean }> {
+  return request('/api/logout', { method: 'POST' })
+}
+
+/** Exchanges a Scribe host JWT for a real Worker session cookie, so /api/*
+ *  calls made from inside the host iframe are authenticated. See the security
+ *  caveat on the Worker's handleHostLogin — the token's signature isn't
+ *  verified server-side. */
+export function hostLogin(token: string): Promise<{ ok: boolean; email?: string; orgId?: string | null }> {
+  return request('/api/host-login', { method: 'POST', body: JSON.stringify({ token }) })
+}
+
+/** Step 1 of a password reset: the server emails a single-use, 15-minute 5-digit
+ *  code to the address (if an account exists) — the account's password is left
+ *  unchanged until step 2. Always resolves the same way regardless of whether the
+ *  account exists, so it can't be used to probe registrations. */
+export function forgotPassword(email: string): Promise<{ ok: boolean }> {
+  return request('/api/forgot-password', { method: 'POST', body: JSON.stringify({ email }) })
+}
+
+/** Step 2 of a password reset: verify the emailed code and set a new password.
+ *  The code is single-use, attempt-limited, and expiring; a wrong/expired code
+ *  comes back as ApiError("Invalid or expired reset code"). */
+export function resetPassword(email: string, code: string, password: string): Promise<{ ok: boolean }> {
+  return request('/api/reset-password', { method: 'POST', body: JSON.stringify({ email, code, password }) })
+}
+
+// ── Meetings (transcripts → Episode/Podcast model) ──────────────────────────────
+
+export interface MeetingData {
+  episodes: Episode[]
+  podcasts: Podcast[]
+  admin: boolean
+}
+
+/** Load every meeting the signed-in user can see and map it onto the UI model. */
+export async function fetchMeetings(): Promise<MeetingData> {
+  const data = await request<{
+    ok: boolean
+    admin?: boolean
+    segments?: RawSegment[]
+    titles?: Record<string, string>
+  }>('/api/transcripts')
+  const meetings = meetingsFromSegments(data.segments || [], data.titles || {})
+  return {
+    episodes: meetings.map((m) => m.episode),
+    podcasts: meetings.map((m) => m.podcast),
+    admin: !!data.admin,
+  }
+}
+
+/** Pushes real calendar names (from this browser's own calendar sync) for
+ *  meetings the signed-in user owns into the Worker's shared title cache, so a
+ *  viewer without their own calendar view of a meeting (chiefly admin) sees
+ *  the real name too — instead of a stale/AI title lingering until the
+ *  meeting is individually reopened. Best-effort; failures are non-fatal. */
+export async function syncMeetingTitles(
+  names: { meetingId: string; calendarName: string }[],
+): Promise<void> {
+  if (!names.length) return
+  await request('/api/meetings/sync-titles', {
+    method: 'POST',
+    body: JSON.stringify({ names: names.map((n) => ({ meeting_id: n.meetingId, calendar_name: n.calendarName })) }),
+  })
+}
+
+// Turn the assistant's markdown reply into the Summary shape the UI renders.
+// We only fill `synthesis` (the readable body); the finance-only modules
+// (ideas, tone, quant, investment readout) stay empty and hide themselves.
+function summaryFromReply(reply: string): Summary {
+  const synthesis = reply
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  return { synthesis: synthesis.length ? synthesis : [reply.trim()], highlights: [], qa: [] }
+}
+
+/** Ask the meeting assistant for a one-page summary of a meeting (OpenAI, server-side).
+ *  The Worker generates a summary once and caches it, so every co-owner sees the
+ *  same one; pass { force } (the Refresh button) to regenerate and overwrite it.
+ *  `title` is the AI-minted display name for an otherwise-unnamed meeting (also
+ *  generated once, while summarizing) — undefined when the meeting already has one
+ *  or naming failed. */
+export async function summarizeMeeting(
+  episode: Episode,
+  opts?: { force?: boolean; calendarName?: string },
+): Promise<{ summary: Summary; title?: string }> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const calendarName = opts?.calendarName?.trim()
+  // calendar_name tells the Worker the meeting already carries a real (calendar)
+  // name, so it should store THAT as the meeting's title instead of minting an
+  // AI one — only a meeting with no calendar name gets one.
+  const data = await request<{ ok: boolean; reply?: string; title?: string }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({
+      meeting_id: meetingId,
+      owner,
+      summarize: true,
+      force: !!opts?.force,
+      has_name: !!calendarName,
+      calendar_name: calendarName || undefined,
+    }),
+  })
+  const title = typeof data.title === 'string' ? data.title.trim() : ''
+  return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
+}
+
+/** The Worker route serving a meeting's recorded audio. Safe to hand straight to
+ *  an <audio src> or a download link: it's same-origin, so the session cookie
+ *  rides along, and the Worker forwards Range requests to the backend — so the
+ *  browser streams and seeks natively instead of buffering the whole file.
+ *
+ *  Recordings run tens of MB over an intermittently congested path (observed
+ *  anywhere from ~11 KB/s to ~4 MB/s on back-to-back requests for the same
+ *  meeting). Pulling that into a JS Blob before playing meant one unlucky
+ *  connection lost the entire transfer; the browser's own media and download
+ *  stacks handle ranges, partial reads, and interruptions far better, so the
+ *  bytes never pass through application code. */
+export function meetingRecordingUrl(episode: Episode): string {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const params = new URLSearchParams({ meeting_id: meetingId })
+  if (owner) params.set('owner', owner)
+  return `/api/recording?${params.toString()}`
+}
+
+/** Checks whether a meeting's recording exists, without downloading it. Reads
+ *  only the response headers and then aborts, so this costs a round trip rather
+ *  than tens of MB — the point is to surface the Worker's specific message
+ *  ("deleted per the retention policy", "never recorded", …) before handing the
+ *  URL to a native player, which can only report a generic failure.
+ *
+ *  Throws NotAuthedError on 401 and ApiError otherwise; resolves when the
+ *  recording is available. */
+export async function checkMeetingRecording(episode: Episode, signal?: AbortSignal): Promise<void> {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  signal?.addEventListener('abort', abort, { once: true })
+  try {
+    const res = await fetch(meetingRecordingUrl(episode), {
+      credentials: 'same-origin',
+      // Ask for a single byte: enough to confirm the backend can serve this
+      // recording, cheap enough that a congested path can't turn the check
+      // itself into the multi-megabyte transfer we're trying to avoid.
+      headers: { Range: 'bytes=0-0' },
+      signal: controller.signal,
+    })
+    if (res.status === 401) throw new NotAuthedError()
+    if (!res.ok && res.status !== 206) {
+      let message = `Request failed (${res.status})`
+      try {
+        const data = await res.json()
+        message = (data && (data.error || data.detail)) || message
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new ApiError(message, res.status)
+    }
+    // Headers are all we needed — drop the connection so a server that ignored
+    // the Range header doesn't keep streaming the whole file at us.
+    controller.abort()
+  } finally {
+    signal?.removeEventListener('abort', abort)
+  }
+}
+
+/** Free-form chat over a single meeting's transcript. `messages` is the running
+ *  conversation ([{role:'user'|'assistant', content}]). Returns the reply text. */
+export async function chatMeeting(
+  episode: Episode,
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const data = await request<{ ok: boolean; reply?: string }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({ meeting_id: meetingId, owner, messages }),
+  })
+  return String(data.reply || '')
+}
+
+/** What the Worker actually assembled for a question, before the model saw it.
+ *
+ *  A wrong answer has several possible authors — the transcript the Worker
+ *  loaded, the search over it, the readers, or the model — and from the outside
+ *  they all look identical. This returns the trace that tells them apart:
+ *  notably `lines` (how much transcript the Worker really has, which can differ
+ *  from what the Transcript tab renders) and `grounding` (the exact text handed
+ *  to the model). Costs a second run of the pipeline, so it's on demand only. */
+export interface ChatTrace {
+  lines: number
+  terms: string[]
+  vocabularySample: string[]
+  plan: {
+    resolved: { asked: string; transcript: string[]; confidence: string }[]
+    terms: string[]
+    scope: string
+    restated: string
+  }
+  chunksTotal: number
+  chunksRead: number
+  mapNotes: string
+  grounding: string
+}
+
+export async function diagnoseMeetingChat(
+  episode: Episode,
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<ChatTrace | null> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const data = await request<{ ok: boolean; debug?: ChatTrace }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({ meeting_id: meetingId, owner, messages, debug: true }),
+  })
+  return data.debug ?? null
+}
+
+/** The deployed Worker's build marker. Unauthenticated, so it answers "is the
+ *  new code live?" without a session — `build` changes only when a deploy
+ *  lands. */
+export async function fetchVersion(): Promise<{ build: string } & Record<string, unknown>> {
+  const res = await fetch('/api/version', { credentials: 'same-origin' })
+  if (!res.ok) throw new ApiError(`Version check failed (${res.status})`, res.status)
+  return res.json()
+}
+
+// ── Weekly per-person rollup ────────────────────────────────────────────────────
+
+/** A single structured action item within a person's rollup. Identity (`id`)
+ *  is stable across cron ticks: the Worker reconciles new transcript evidence
+ *  against existing items (reaffirm / complete / cancel / new) instead of
+ *  re-deriving the whole list, so a task's status here reflects real evidence,
+ *  not just whether the model happened to mention it again this pass. */
+export interface TodoItem {
+  id: string
+  text: string
+  status: 'open' | 'done' | 'dropped'
+  priority: 'high' | 'medium' | 'low'
+  dueDate: string | null
+  overdue?: boolean
+  owner: string
+  firstSeenMeetingId: string
+  firstSeenAt: number
+  lastSeenAt: number
+  completedMeetingId?: string
+  completedAt?: number
+  evidence?: string
+  missCount: number
+}
+
+export interface PersonRollup {
+  name: string
+  overall: string
+  accomplished: string[]
+  todo: string[]
+  /** Structured items backing `accomplished`/`todo`, when the Worker has
+   *  reconciled this person under the structured scheme. Absent (or empty) on
+   *  a not-yet-upgraded record — renderers should fall back to the plain
+   *  string lists in that case. */
+  items?: TodoItem[]
+}
+
+/** A per-person status rollup across all the signed-in user's meetings: overall
+ *  view, what each participant has accomplished, and their current to-dos. The
+ *  Worker persists this per user and only rebuilds it when the meetings change;
+ *  pass { force } (the "Regenerate" button) to rebuild it on demand. */
+export async function fetchWeeklyPeople(opts?: { force?: boolean }): Promise<PersonRollup[]> {
+  const data = await request<{ ok: boolean; people?: PersonRollup[] }>('/api/weekly/people', {
+    method: 'POST',
+    body: JSON.stringify({ force: !!opts?.force }),
+  })
+  return data.people || []
+}
+
+// ── Weekly master summary ("summary of summaries") ───────────────────────────────
+// The cross-meeting synthesis is built server-side from each meeting's cached
+// detailed summary and persisted per user + week, so once a week's summary exists
+// it is returned as-is and never regenerated on a normal visit (only Refresh /
+// force rebuilds it). Each meeting carries its 1-based `index` so the model's
+// `[n]` citations line up with the client's deterministic source order.
+
+/** A meeting reference the weekly endpoints authorize + read the summary for. */
+export interface WeeklyMeetingRef {
+  meeting_id: string
+  owner: string
+  /** 1-based citation index in the client's source order (for [n] alignment). */
+  index?: number
+}
+
+export interface WeeklyAiResult {
+  /** The synthesised narrative, or null when no meeting in the week is summarized yet. */
+  ai: WeeklyAi | null
+  /** True when the saved edition was returned (not freshly generated). */
+  cached: boolean
+  generatedAt: number | null
+  /** How many of the requested meetings actually had a summary to synthesise from. */
+  usedCount: number
+  skipped: number
+}
+
+/** Turn a set of episodes into the meeting refs the weekly endpoints expect,
+ *  numbered 1-based in the given (source) order for citation alignment. */
+export function meetingRefs(episodes: Episode[]): WeeklyMeetingRef[] {
+  return episodes.map((e, i) => {
+    const { owner, meetingId } = decodeMeetingId(e.id)
+    return { meeting_id: meetingId, owner, index: i + 1 }
+  })
+}
+
+/** Build (or fetch the saved) weekly master summary for a week bucket. Returns
+ *  `ai: null` when none of the week's meetings are summarized yet. */
+export async function fetchWeeklyAiSummary(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  opts: { range?: string; force?: boolean } = {},
+): Promise<WeeklyAiResult> {
+  const data = await request<{
+    ok: boolean
+    ai?: WeeklyAi | null
+    cached?: boolean
+    generatedAt?: number | null
+    usedCount?: number
+    skipped?: number
+  }>('/api/weekly/summary', {
+    method: 'POST',
+    body: JSON.stringify({ week, range: opts.range || '', force: !!opts.force, meetings }),
+  })
+  return {
+    ai: data.ai ?? null,
+    cached: !!data.cached,
+    generatedAt: data.generatedAt ?? null,
+    usedCount: data.usedCount ?? 0,
+    skipped: data.skipped ?? 0,
+  }
+}
+
+/** A meeting's server-cached detailed summary, mapped onto the UI Summary shape. */
+export interface CachedMeetingSummary {
+  meetingId: string
+  title: string
+  summary: Summary
+}
+
+/** Peek the already-cached detailed summary for each requested meeting (no
+ *  generation). Lets the Weekly page hydrate its episode model from summaries the
+ *  auto-summary cron / prior opens already produced, so the weekly populates
+ *  without opening every meeting. Meetings without a cached summary are omitted. */
+export async function fetchCachedMeetingSummaries(meetings: WeeklyMeetingRef[]): Promise<CachedMeetingSummary[]> {
+  if (!meetings.length) return []
+  const data = await request<{
+    ok: boolean
+    summaries?: { meeting_id: string; title: string; summary: string }[]
+  }>('/api/weekly/meetings', {
+    method: 'POST',
+    body: JSON.stringify({ meetings }),
+  })
+  return (data.summaries || []).map((s) => ({
+    meetingId: String(s.meeting_id),
+    title: String(s.title || ''),
+    summary: summaryFromReply(String(s.summary || '')),
+  }))
+}
+
+/** Free-form chat over a week's meeting summaries + the saved master summary.
+ *  `messages` is the running conversation; returns the assistant's reply. */
+export async function chatWeekly(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const data = await request<{ ok: boolean; reply?: string }>('/api/weekly/chat', {
+    method: 'POST',
+    body: JSON.stringify({ week, meetings, messages }),
+  })
+  return String(data.reply || '')
+}
+
+// ── YouTube videos ───────────────────────────────────────────────────────────
+// The same deal as meetings, for videos: the Worker owns the transcript (indexed
+// per account), so a user only ever sees the videos they added and admin sees
+// every account's. The AI routes mirror /api/ai — cached one-shot summary +
+// free-form chat, both answered from the transcript server-side.
+
+export interface VideoList {
+  videos: VideoRecord[]
+  admin: boolean
+}
+
+/** Every video the signed-in user can see. `email` is admin-only — it narrows
+ *  the cross-user list to one account. In-flight jobs are refreshed server-side
+ *  on each call, so polling this one route keeps the whole list live. */
+export async function fetchVideos(email?: string): Promise<VideoList> {
+  const qs = email ? `?email=${encodeURIComponent(email)}` : ''
+  const data = await request<{ ok: boolean; admin?: boolean; videos?: VideoRecord[] }>(`/api/youtube${qs}`)
+  return { videos: data.videos || [], admin: !!data.admin }
+}
+
+/** Transcribe a YouTube link under the signed-in account. The Worker fetches and
+ *  stores the captions inline, so the result is already known when this resolves:
+ *  `failed` + `error` when the video couldn't be transcribed (no captions, a live
+ *  stream, an unavailable video, a bot-gated fetch). Adding a video already in the
+ *  list returns that one (`duplicate`) instead of transcribing it twice. */
+export async function addVideo(url: string): Promise<{ video: VideoRecord; duplicate: boolean; failed: boolean; error: string }> {
+  const data = await request<{
+    ok: boolean
+    video: VideoRecord
+    duplicate?: boolean
+    failed?: boolean
+    error?: string | null
+  }>('/api/youtube', { method: 'POST', body: JSON.stringify({ url }) })
+  // Transcription runs inline, so the row can come back already failed — with
+  // its reason. That is not an HTTP error (the video IS in the list now), so the
+  // caller has to surface it rather than reporting a success.
+  return {
+    video: data.video,
+    duplicate: !!data.duplicate,
+    failed: !!data.failed || data.video?.status === 'failed',
+    error: String(data.error || data.video?.error || ''),
+  }
+}
+
+/** One video plus its transcript. `segments` is the stored, already-timed
+ *  transcript (empty until it completes); `transcript` is the same thing as flat
+ *  text, kept for callers that just want the words. */
+export async function fetchVideo(
+  id: string,
+  owner?: string,
+): Promise<{ video: VideoRecord; segments: StoredSegment[]; transcript: string }> {
+  const params = new URLSearchParams({ id })
+  if (owner) params.set('owner', owner)
+  const data = await request<{
+    ok: boolean
+    video: VideoRecord
+    segments?: StoredSegment[]
+    transcript?: string
+  }>(`/api/youtube/video?${params.toString()}`)
+  return { video: data.video, segments: data.segments || [], transcript: String(data.transcript || '') }
+}
+
+/** Remove a video (and its cached transcript) from the account's list. */
+export function deleteVideo(id: string, owner?: string): Promise<{ ok: boolean }> {
+  return request('/api/youtube/delete', { method: 'POST', body: JSON.stringify({ id, owner }) })
+}
+
+/** Ask for a video's one-page summary. Generated once and cached per VIDEO, so
+ *  everyone who transcribes the same video shares it; pass { force } (Refresh)
+ *  to regenerate. `title` comes back when the backend had no name for the video
+ *  and one was minted while summarizing. */
+export async function summarizeVideo(
+  video: { id: string; owner: string },
+  opts?: { force?: boolean },
+): Promise<{ summary: Summary; title?: string }> {
+  const data = await request<{ ok: boolean; reply?: string; title?: string }>('/api/youtube/ai', {
+    method: 'POST',
+    body: JSON.stringify({ id: video.id, owner: video.owner, summarize: true, force: !!opts?.force }),
+  })
+  const title = typeof data.title === 'string' ? data.title.trim() : ''
+  return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
+}
+
+/** Free-form chat over a single video's transcript. */
+export async function chatVideo(
+  video: { id: string; owner: string },
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const data = await request<{ ok: boolean; reply?: string }>('/api/youtube/ai', {
+    method: 'POST',
+    body: JSON.stringify({ id: video.id, owner: video.owner, messages }),
+  })
+  return String(data.reply || '')
+}
+
+// ── Admin people tracker ─────────────────────────────────────────────────────
+// Admin picks a set of people to track across ALL meetings (not just the
+// caller's own); the Worker's cron keeps each person's rollup updated as new
+// meetings mention them. Every /api/tracking* route is admin-only.
+
+export interface TrackedPerson extends PersonRollup {
+  slug: string
+  meetingCount: number
+  updatedAt: number | null
+  /** True until the background cron has produced a real rollup for a
+   *  just-added name — the UI should poll fetchTracking() while this is set. */
+  pending?: boolean
+}
+
+export interface TrackingWatermark {
+  n: number
+  lastRegenAt: number
+}
+
+export interface TrackingState {
+  selection: string[]
+  people: TrackedPerson[]
+  watermark: TrackingWatermark | null
+}
+
+/** Every distinct named speaker across every meeting, for the tracking picker. */
+export async function fetchTrackingDirectory(): Promise<string[]> {
+  const data = await request<{ ok: boolean; people?: string[] }>('/api/tracking/directory')
+  return data.people || []
+}
+
+/** Current tracked selection + each person's latest rollup (or a pending
+ *  placeholder). Poll this while any person is `pending`. */
+export async function fetchTracking(): Promise<TrackingState> {
+  const data = await request<{
+    ok: boolean
+    selection?: string[]
+    people?: TrackedPerson[]
+    watermark?: TrackingWatermark | null
+  }>('/api/tracking')
+  return { selection: data.selection || [], people: data.people || [], watermark: data.watermark ?? null }
+}
+
+/** Persists the tracked-people selection. Returns immediately — a newly added
+ *  name's rollup is built by the background cron, not generated inline. */
+export async function saveTrackingSelection(names: string[]): Promise<string[]> {
+  const data = await request<{ ok: boolean; selection?: string[] }>('/api/tracking', {
+    method: 'POST',
+    body: JSON.stringify({ names }),
+  })
+  return data.selection || []
+}
+
+/** How each tracked person's week went — completed / newly opened / carried
+ *  over and overdue — bucketed server-side from the already-reconciled
+ *  structured items (no AI call, instant). Admin-only. */
+export interface WeeklyTrackingPerson {
+  name: string
+  slug: string
+  completedThisWeek: string[]
+  openedThisWeek: string[]
+  carriedOverdue: string[]
+}
+
+export async function fetchWeeklyTracking(range: { weekStartMs: number; weekEndMs: number }): Promise<WeeklyTrackingPerson[]> {
+  const data = await request<{ ok: boolean; people?: WeeklyTrackingPerson[] }>('/api/weekly/tracking', {
+    method: 'POST',
+    body: JSON.stringify({ weekStartMs: range.weekStartMs, weekEndMs: range.weekEndMs }),
+  })
+  return data.people || []
+}
+
+// ── The notetaker bot ───────────────────────────────────────────────────────────
+
+export function sendBot(
+  meetingUrl: string,
+  action: 'join' | 'leave' = 'join',
+): Promise<{ ok: boolean; status: number; response: unknown }> {
+  return request(`/api/${action}`, { method: 'POST', body: JSON.stringify({ meeting_url: meetingUrl }) })
+}
+
+// ── Schedules ───────────────────────────────────────────────────────────────────
+
+export interface Schedule {
+  id: string
+  meetingUrl: string
+  nextRun: number
+  recurrence: 'once' | 'daily' | 'weekdays' | 'weekly'
+  timeZone: string
+  lastRun: number | null
+  lastStatus: string | null
+}
+
+/** A schedule as admin sees it — every user's, each tagged with its owner. */
+export interface AdminSchedule extends Schedule {
+  owner: string
+}
+
+export interface NewSchedule {
+  meeting_url: string
+  /** "YYYY-MM-DDTHH:MM" wall-clock, as picked. */
+  local_datetime: string
+  recurrence: 'once' | 'daily' | 'weekdays' | 'weekly'
+  /** IANA zone the wall-clock is in. */
+  time_zone: string
+}
+
+/** A signed-in user's own schedules. Admins have none of their own — use
+ *  adminListSchedules for the cross-user view. */
+export async function listSchedules(): Promise<Schedule[]> {
+  const data = await request<{ ok: boolean; schedules?: Schedule[] }>('/api/schedules')
+  return data.schedules || []
+}
+
+/** Admin-only: every user's schedules (each tagged with its owner), or just one
+ *  user's when `email` is given. */
+export async function adminListSchedules(email?: string): Promise<AdminSchedule[]> {
+  const qs = email ? `?email=${encodeURIComponent(email)}` : ''
+  const data = await request<{ ok: boolean; schedules?: AdminSchedule[] }>(`/api/schedules${qs}`)
+  return data.schedules || []
+}
+
+export async function createSchedule(input: NewSchedule): Promise<Schedule> {
+  const data = await request<{ ok: boolean; schedule: Schedule }>('/api/schedules', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return data.schedule
+}
+
+/** Cancel a schedule. Pass `owner` when acting as admin on another user's
+ *  schedule — a normal user's own session always deletes only their own. */
+export function deleteSchedule(id: string, owner?: string): Promise<{ ok: boolean }> {
+  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id, owner }) })
+}
+
+// ── Calendar ────────────────────────────────────────────────────────────────────
+
+export interface CalendarEvent {
+  id?: number | string
+  meeting_url?: string
+  url?: string
+  title?: string
+  summary?: string
+  start?: string
+  start_time?: string
+  end_time?: string
+  platform?: string
+  status?: string
+  meeting_id?: number | string | null
+  [k: string]: unknown
+}
+
+/** Normalizes whatever shape the upstream calendar endpoint returns (a bare
+ *  array, or one of a few wrapper keys) into a flat event list. */
+export function normalizeCalendarEvents(payload: any): CalendarEvent[] {
+  if (!payload) return []
+  const arr = Array.isArray(payload)
+    ? payload
+    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
+  return Array.isArray(arr) ? arr : []
+}
+
+export function calendarSync(): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/sync', { method: 'POST', body: '{}' })
+}
+
+/** Returns the raw calendar payload from upstream; shape is normalized by the caller.
+ *  Pass includeCancelled to also get removed (status "cancelled") meetings. `email`
+ *  is admin-only — it names which user's calendar to read (admins have none of
+ *  their own); a normal user's session always reads their own calendar. */
+export async function calendarMeetings(
+  includeCancelled = false,
+  email?: string,
+): Promise<{ ok: boolean; status: number; calendar: any }> {
+  const params = new URLSearchParams()
+  if (includeCancelled) params.set('include_cancelled', 'true')
+  if (email) params.set('email', email)
+  const qs = params.toString()
+  return request('/api/calendar/meetings' + (qs ? `?${qs}` : ''))
+}
+
+/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. `email`
+ *  is admin-only — the user to act as. */
+export function calendarRemove(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/remove', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
+}
+
+/** Restore (unremove) a cancelled calendar meeting so the bot will join it again.
+ *  `email` is admin-only — the user to act as. */
+export function calendarRestore(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/restore', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
+}
+
+/** One-shot "unsync calendar": in a single upstream call, cancel every pending
+ *  meeting, stop any live bots, and drop the stored Google OAuth connection (so
+ *  a later sync reports connected:false until the calendar is re-authorized).
+ *  `email` is admin-only — the user to act as. */
+export function calendarUnsubscribe(
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/unsubscribe', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  })
+}
+
+/** Admin-only: every distinct user email that has (or has had) meetings or
+ *  schedules — feeds the "Scheduled Meetings" admin picker. */
+export async function adminListUsers(): Promise<string[]> {
+  const data = await request<{ ok: boolean; users?: string[] }>('/api/admin/users')
+  return data.users || []
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inert podcast-era exports — no meeting backend. Kept so their callers compile;
+// the corresponding UI is hidden in the meetings build.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function searchPodcasts(_query: string, _signal?: AbortSignal, _limit?: number): Promise<never[]> {
+  return Promise.resolve([])
+}
+
+export function resolveVideo(_query: string, _signal?: AbortSignal): Promise<string | null> {
+  return Promise.resolve(null)
+}
+
+export function subscribeWeekly(
+  email: string,
+  _opts: { name?: string } = {},
+): Promise<{ subscribed: boolean; email: string; message: string }> {
+  return Promise.resolve({ subscribed: true, email, message: "You'll get the weekly meetings digest." })
+}
+
+export function unsubscribeWeekly(email: string): Promise<{ subscribed: boolean; email: string }> {
+  return Promise.resolve({ subscribed: false, email })
+}
+
+export function registerWeeklyRecipient(_email: string): Promise<void> {
+  return Promise.resolve()
+}
+
+export function unregisterWeeklyRecipient(_email: string): Promise<void> {
+  return Promise.resolve()
+}
+
+export function getWeeklySchedule(): Promise<WeeklySchedule | null> {
+  return Promise.resolve(null)
+}
+
+export function setWeeklySchedule(
+  s: WeeklySchedule,
+): Promise<{ ok: boolean; schedule?: WeeklySchedule; message?: string }> {
+  return Promise.resolve({ ok: true, schedule: s })
+}
+
+export async function emailWeeklyEdition(
+  recipients: string | string[],
+  _weekly: WeeklySummary,
+  _episodeById: (id: string) => Episode | undefined,
+  _podcastById: (id: string) => Podcast | undefined,
+): Promise<EmailResult> {
+  const to = normalizeRecipients(undefined, Array.isArray(recipients) ? recipients : [recipients])
+  if (!to.length) return { ok: false, message: 'No valid recipient to send to.' }
+  return { ok: true, message: to.length === 1 ? `Sent to ${to[0]}` : `Sent to ${to.length} recipients` }
+}
+
+export async function emailEpisodeSummary(
+  recipients: string | string[],
+  episode: Episode,
+  _podcast?: Podcast,
+): Promise<EmailResult> {
+  if (!episode.summary) return { ok: false, message: 'This meeting has no summary to send yet.' }
+  const to = normalizeRecipients(undefined, Array.isArray(recipients) ? recipients : [recipients])
+  if (!to.length) return { ok: false, message: 'No valid recipient to send to.' }
+  return { ok: true, message: to.length === 1 ? `Sent to ${to[0]}` : `Sent to ${to.length} recipients` }
+}
