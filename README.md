@@ -10,6 +10,11 @@ A **React dashboard** (Vite + TypeScript + Tailwind) served by a **Cloudflare Wo
 - **Calendar** — sync your calendar and send the notetaker to upcoming meetings in one click.
 - **Meeting Assistant (AI)** — each meeting auto-summarizes its transcript and answers follow-up questions. The transcript is loaded server-side (per-user scoping) and sent to OpenAI with the `OPENAI_API_KEY` held as a Worker **secret**.
 
+## Architecture Diagram (GitDiagram)
+
+[![Architecture diagram of blastre/scribe-dashboard](https://gitdiagram.com/blastre/scribe-dashboard/diagram.png)](https://gitdiagram.com/blastre/scribe-dashboard?utm_source=readme&utm_medium=picture)
+
+
 ## Develop & build
 
 ```bash
